@@ -4,24 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/alist-org/alist/v3/internal/op"
-	"golang.org/x/oauth2"
-	"io"
-	"net/http"
-	"strconv"
-	"strings"
-
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	hash_extend "github.com/alist-org/alist/v3/pkg/utils/hash"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/oauth2"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 )
 
 type PikPak struct {
@@ -54,6 +49,7 @@ func (d *PikPak) Init(ctx context.Context) (err error) {
 				d.Common.CaptchaToken = token
 				op.MustSaveDriverStorage(d)
 			},
+			LowLatencyAddr: "",
 		}
 	}
 
@@ -71,6 +67,13 @@ func (d *PikPak) Init(ctx context.Context) (err error) {
 		d.PackageName = WebPackageName
 		d.Algorithms = WebAlgorithms
 		d.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
+	} else if d.Platform == "pc" {
+		d.ClientID = PCClientID
+		d.ClientSecret = PCClientSecret
+		d.ClientVersion = PCClientVersion
+		d.PackageName = PCPackageName
+		d.Algorithms = PCAlgorithms
+		d.UserAgent = "MainWindow Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) PikPak/2.5.6.4831 Chrome/100.0.4896.160 Electron/18.3.15 Safari/537.36"
 	}
 
 	if d.Addition.CaptchaToken != "" && d.Addition.RefreshToken == "" {
@@ -96,37 +99,36 @@ func (d *PikPak) Init(ctx context.Context) (err error) {
 
 	// 如果已经有RefreshToken，直接获取AccessToken
 	if d.Addition.RefreshToken != "" {
-		// 使用 oauth2 刷新令牌
-		// 初始化 oauth2Token
-		d.oauth2Token = oauth2.ReuseTokenSource(nil, utils.TokenSource(func() (*oauth2.Token, error) {
-			return oauth2Config.TokenSource(ctx, &oauth2.Token{
-				RefreshToken: d.Addition.RefreshToken,
-			}).Token()
-		}))
+		if d.RefreshTokenMethod == "oauth2" {
+			// 使用 oauth2 刷新令牌
+			// 初始化 oauth2Token
+			d.initializeOAuth2Token(ctx, oauth2Config, d.Addition.RefreshToken)
+			if err := d.refreshTokenByOAuth2(); err != nil {
+				return err
+			}
+		} else {
+			if err := d.refreshToken(d.Addition.RefreshToken); err != nil {
+				return err
+			}
+		}
+
 	} else {
 		// 如果没有填写RefreshToken，尝试登录 获取 refreshToken
 		if err := d.login(); err != nil {
 			return err
 		}
-		d.oauth2Token = oauth2.ReuseTokenSource(nil, utils.TokenSource(func() (*oauth2.Token, error) {
-			return oauth2Config.TokenSource(ctx, &oauth2.Token{
-				RefreshToken: d.RefreshToken,
-			}).Token()
-		}))
-	}
+		if d.RefreshTokenMethod == "oauth2" {
+			d.initializeOAuth2Token(ctx, oauth2Config, d.RefreshToken)
+		}
 
-	token, err := d.oauth2Token.Token()
-	if err != nil {
-		return err
 	}
-	d.RefreshToken = token.RefreshToken
-	d.AccessToken = token.AccessToken
 
 	// 获取CaptchaToken
-	err = d.RefreshCaptchaTokenAtLogin(GetAction(http.MethodGet, "https://api-drive.mypikpak.com/drive/v1/files"), d.Common.UserID)
+	err = d.RefreshCaptchaTokenAtLogin(GetAction(http.MethodGet, "https://api-drive.mypikpak.com/drive/v1/files"), d.Common.GetUserID())
 	if err != nil {
 		return err
 	}
+
 	// 更新UserAgent
 	if d.Platform == "android" {
 		d.Common.UserAgent = BuildCustomUserAgent(utils.GetMD5EncodeStr(d.Username+d.Password), AndroidClientID, AndroidPackageName, AndroidSdkVersion, AndroidClientVersion, AndroidPackageName, d.Common.UserID)
@@ -135,6 +137,15 @@ func (d *PikPak) Init(ctx context.Context) (err error) {
 	// 保存 有效的 RefreshToken
 	d.Addition.RefreshToken = d.RefreshToken
 	op.MustSaveDriverStorage(d)
+
+	if d.UseLowLatencyAddress && d.Addition.CustomLowLatencyAddress != "" {
+		d.Common.LowLatencyAddr = d.Addition.CustomLowLatencyAddress
+	} else if d.UseLowLatencyAddress {
+		d.Common.LowLatencyAddr = findLowestLatencyAddress(DlAddr)
+		d.Addition.CustomLowLatencyAddress = d.Common.LowLatencyAddr
+		op.MustSaveDriverStorage(d)
+	}
+
 	return nil
 }
 
@@ -154,6 +165,7 @@ func (d *PikPak) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 
 func (d *PikPak) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	var resp File
+	var url string
 	queryParams := map[string]string{
 		"_magic":         "2021",
 		"usage":          "FETCH",
@@ -169,14 +181,22 @@ func (d *PikPak) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	if err != nil {
 		return nil, err
 	}
-	link := model.Link{
-		URL: resp.WebContentLink,
-	}
+	url = resp.WebContentLink
+
 	if !d.DisableMediaLink && len(resp.Medias) > 0 && resp.Medias[0].Link.Url != "" {
 		log.Debugln("use media link")
-		link.URL = resp.Medias[0].Link.Url
+		url = resp.Medias[0].Link.Url
 	}
-	return &link, nil
+
+	if d.UseLowLatencyAddress && d.Common.LowLatencyAddr != "" {
+		// 替换为加速链接
+		re := regexp.MustCompile(`https://[^/]+/download/`)
+		url = re.ReplaceAllString(url, "https://"+d.Common.LowLatencyAddr+"/download/")
+	}
+
+	return &model.Link{
+		URL: url,
+	}, nil
 }
 
 func (d *PikPak) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
@@ -271,27 +291,17 @@ func (d *PikPak) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	}
 
 	params := resp.Resumable.Params
-	endpoint := strings.Join(strings.Split(params.Endpoint, ".")[1:], ".")
-	cfg := &aws.Config{
-		Credentials: credentials.NewStaticCredentials(params.AccessKeyID, params.AccessKeySecret, params.SecurityToken),
-		Region:      aws.String("pikpak"),
-		Endpoint:    &endpoint,
+	//endpoint := strings.Join(strings.Split(params.Endpoint, ".")[1:], ".")
+	// web 端上传 返回的endpoint 为 `mypikpak.com` | android 端上传 返回的endpoint 为 `vip-lixian-07.mypikpak.com`·
+	if d.Addition.Platform == "android" {
+		params.Endpoint = "mypikpak.com"
 	}
-	ss, err := session.NewSession(cfg)
-	if err != nil {
-		return err
+
+	if stream.GetSize() <= 10*utils.MB { // 文件大小 小于10MB，改用普通模式上传
+		return d.UploadByOSS(&params, stream, up)
 	}
-	uploader := s3manager.NewUploader(ss)
-	if stream.GetSize() > s3manager.MaxUploadParts*s3manager.DefaultUploadPartSize {
-		uploader.PartSize = stream.GetSize() / (s3manager.MaxUploadParts - 1)
-	}
-	input := &s3manager.UploadInput{
-		Bucket: &params.Bucket,
-		Key:    &params.Key,
-		Body:   io.TeeReader(stream, driver.NewProgress(stream.GetSize(), up)),
-	}
-	_, err = uploader.UploadWithContext(ctx, input)
-	return err
+	// 分片上传
+	return d.UploadByMultipart(&params, stream.GetSize(), stream, up)
 }
 
 // 离线下载文件
